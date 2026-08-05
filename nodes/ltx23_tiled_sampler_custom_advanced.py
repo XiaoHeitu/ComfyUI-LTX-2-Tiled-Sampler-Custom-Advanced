@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from comfy_api.latest import io
+import torch
 import comfy.model_management
 import comfy.sample
 import comfy.utils

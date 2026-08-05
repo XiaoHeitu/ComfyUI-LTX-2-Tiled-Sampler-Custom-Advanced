@@ -86,7 +86,30 @@ def _slice_time(tensor: torch.Tensor, start: int, end: int, dim: int = 2) -> tor
 
 
 def _slice_video_spatial(tensor: torch.Tensor, v_start: int, v_end: int, h_start: int, h_end: int) -> torch.Tensor:
-    return tensor[:, :, :, v_start:v_end, h_start:h_end]
+    if tensor.ndim < 5:
+        return tensor
+
+    height = tensor.shape[3]
+    width = tensor.shape[4]
+
+    # Some LTX noise masks are temporal-only placeholders with singleton
+    # spatial dims (for example 1x1). Those masks should keep their full
+    # spatial extent instead of being cropped by video tile coordinates.
+    if height <= 1:
+        v_slice = slice(0, height)
+    else:
+        v0 = max(0, min(v_start, height))
+        v1 = max(v0, min(v_end, height))
+        v_slice = slice(v0, v1)
+
+    if width <= 1:
+        h_slice = slice(0, width)
+    else:
+        h0 = max(0, min(h_start, width))
+        h1 = max(h0, min(h_end, width))
+        h_slice = slice(h0, h1)
+
+    return tensor[:, :, :, v_slice, h_slice]
 
 
 def split_av_components(value):
