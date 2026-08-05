@@ -15,9 +15,11 @@ from ..utils.latent_ops import (
     detect_latent_kind,
     make_nested,
     move_to_device,
+    prepend_first_temporal_slice,
     slice_video_tile,
     slice_video_window_payload,
     split_av_components,
+    strip_first_temporal_slice,
 )
 from ..utils.tile_blending import blend_tiles, build_spatial_tiles
 
@@ -95,6 +97,25 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return move_to_device(x0_out, comfy.model_management.intermediate_device())
 
     @classmethod
+    def _normalize_output_structure(cls, value, latent_kind: str, reference_samples):
+        if value is None:
+            return None
+        if latent_kind != "ltxav":
+            return value
+        if getattr(value, "is_nested", False):
+            tensors = value.unbind()
+            if len(tensors) == 2:
+                return value
+            raise ValueError(f"LTXAV 输出必须包含 2 个分支，当前得到 {len(tensors)} 个。")
+
+        ref_video, ref_audio = split_av_components(reference_samples)
+        rebuilt = comfy.utils.unpack_latents(value, [ref_video.shape, ref_audio.shape])
+        if len(rebuilt) != 2:
+            raise ValueError(f"LTXAV 输出重建失败，期望 2 个分支，当前得到 {len(rebuilt)} 个。")
+        print("[LTX23TiledSampler] 检测到 AV 输出为普通 tensor，已按原始分支形状重建为 NestedTensor。", flush=True)
+        return make_nested(rebuilt[0], rebuilt[1])
+
+    @classmethod
     def _run_subsample(cls, guider, sampler, sigmas, latent_samples, sub_noise, sub_mask, seed):
         x0_output = {}
         callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
@@ -114,7 +135,52 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return sampled, x0
 
     @classmethod
-    def _sample_video_window(cls, guider, sampler, sigmas, window_samples, window_noise, window_mask, latent_tile, latent_overlap, seed):
+    def _make_video_active_mask(cls, tile_video_samples, tile_video_mask):
+        if tile_video_mask is not None:
+            return tile_video_mask
+        return torch.ones(
+            (tile_video_samples.shape[0], 1, tile_video_samples.shape[2], tile_video_samples.shape[3], tile_video_samples.shape[4]),
+            dtype=torch.float32,
+            device=tile_video_samples.device,
+        )
+
+    @classmethod
+    def _make_frozen_audio_mask(cls, audio_latent):
+        return torch.zeros(
+            (audio_latent.shape[0], 1, audio_latent.shape[2], 1),
+            dtype=torch.float32,
+            device=audio_latent.device,
+        )
+
+    @classmethod
+    def _prime_window_audio(cls, guider, sampler, sigmas, video_samples, video_noise, video_mask, audio_samples, audio_noise, audio_mask, region, seed):
+        tile_video_samples = slice_video_tile(video_samples, region)
+        tile_video_noise = slice_video_tile(video_noise, region)
+        tile_video_mask = slice_video_tile(video_mask, region) if video_mask is not None else None
+        nested_samples = make_nested(tile_video_samples, audio_samples)
+        nested_noise = make_nested(tile_video_noise, audio_noise)
+        nested_mask = make_nested(tile_video_mask, audio_mask) if (tile_video_mask is not None or audio_mask is not None) else None
+        print(
+            f"[LTX23TiledSampler] 使用首个 tile 预生成当前时间窗口的冻结音频 "
+            f"row={region.row} col={region.col}",
+            flush=True,
+        )
+        sampled, x0 = cls._run_subsample(guider, sampler, sigmas, nested_samples, nested_noise, nested_mask, seed)
+        _, sampled_audio = split_av_components(sampled)
+        x0_audio = None
+        if x0 is not None:
+            _, x0_audio = split_av_components(x0)
+        return sampled_audio, x0_audio
+
+    @classmethod
+    def _sample_video_window(cls, guider, sampler, sigmas, window_samples, window_noise, window_mask, latent_tile, latent_overlap, seed, causal_fix=False):
+        base_shape = tuple(window_samples.shape)
+        if causal_fix:
+            print("[LTX23TiledSampler] 对非首个视频时间窗口应用 LTX 首帧因果补偿。", flush=True)
+            window_samples = prepend_first_temporal_slice(window_samples, dim=2)
+            window_noise = prepend_first_temporal_slice(window_noise, dim=2)
+            window_mask = prepend_first_temporal_slice(window_mask, dim=2) if window_mask is not None else None
+
         height = window_samples.shape[3]
         width = window_samples.shape[4]
         regions = build_spatial_tiles(height, width, latent_tile, latent_overlap)
@@ -132,30 +198,41 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             tile_noise = slice_video_tile(window_noise, region)
             tile_mask = slice_video_tile(window_mask, region) if window_mask is not None else None
             sampled, x0 = cls._run_subsample(guider, sampler, sigmas, tile_samples, tile_noise, tile_mask, seed)
+            if causal_fix:
+                sampled = strip_first_temporal_slice(sampled, dim=2)
+                if x0 is not None:
+                    x0 = strip_first_temporal_slice(x0, dim=2)
             tile_outputs.append((region, sampled))
             if x0 is not None:
                 tile_x0_outputs.append((region, x0))
 
         blended = blend_tiles(
-            (window_samples.shape[0], window_samples.shape[1], window_samples.shape[2], height, width),
+            (base_shape[0], base_shape[1], base_shape[2], base_shape[3], base_shape[4]),
             tile_outputs,
         )
         blended_x0 = None
         if tile_x0_outputs and len(tile_x0_outputs) == len(tile_outputs):
             blended_x0 = blend_tiles(
-                (window_samples.shape[0], window_samples.shape[1], window_samples.shape[2], height, width),
+                (base_shape[0], base_shape[1], base_shape[2], base_shape[3], base_shape[4]),
                 tile_x0_outputs,
             )
         return blended, blended_x0
 
     @classmethod
-    def _sample_av_window(cls, guider, sampler, sigmas, payload, latent_tile, latent_overlap, seed):
+    def _sample_av_window(cls, guider, sampler, sigmas, payload, latent_tile, latent_overlap, seed, causal_fix=False):
         video_samples = payload["video_samples"]
         audio_samples = payload["audio_samples"]
         video_noise = payload["video_noise"]
         audio_noise = payload["audio_noise"]
         video_mask = payload["video_mask"]
         audio_mask = payload["audio_mask"]
+        base_video_shape = tuple(video_samples.shape)
+
+        if causal_fix:
+            print("[LTX23TiledSampler] 对非首个 AV 时间窗口应用 LTX 首帧因果补偿。", flush=True)
+            video_samples = prepend_first_temporal_slice(video_samples, dim=2)
+            video_noise = prepend_first_temporal_slice(video_noise, dim=2)
+            video_mask = prepend_first_temporal_slice(video_mask, dim=2) if video_mask is not None else None
 
         height = video_samples.shape[3]
         width = video_samples.shape[4]
@@ -167,15 +244,44 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         audio_x0_output = None
 
         if len(regions) > 1:
-            print("[LTX23TiledSampler] LTXAV 模式下仅对视频分支做空间切块，音频保留首个 tile 的结果。", flush=True)
+            print("[LTX23TiledSampler] LTXAV 模式下先为当前时间窗口生成冻结音频，再对视频分支做空间切块。", flush=True)
+            audio_output, audio_x0_output = cls._prime_window_audio(
+                guider,
+                sampler,
+                sigmas,
+                video_samples,
+                video_noise,
+                video_mask,
+                audio_samples,
+                audio_noise,
+                audio_mask,
+                regions[0],
+                seed,
+            )
+            frozen_audio_mask = cls._make_frozen_audio_mask(audio_output)
+        else:
+            frozen_audio_mask = None
 
         for region in regions:
             tile_video_samples = slice_video_tile(video_samples, region)
             tile_video_noise = slice_video_tile(video_noise, region)
             tile_video_mask = slice_video_tile(video_mask, region) if video_mask is not None else None
-            nested_samples = make_nested(tile_video_samples, audio_samples)
+
+            if len(regions) > 1:
+                nested_samples = make_nested(tile_video_samples, audio_output)
+                effective_video_mask = cls._make_video_active_mask(tile_video_samples, tile_video_mask)
+                effective_audio_mask = frozen_audio_mask
+            else:
+                nested_samples = make_nested(tile_video_samples, audio_samples)
+                effective_video_mask = tile_video_mask
+                effective_audio_mask = audio_mask
+
             nested_noise = make_nested(tile_video_noise, audio_noise)
-            nested_mask = make_nested(tile_video_mask, audio_mask) if (tile_video_mask is not None or audio_mask is not None) else None
+            nested_mask = (
+                make_nested(effective_video_mask, effective_audio_mask)
+                if (effective_video_mask is not None or effective_audio_mask is not None)
+                else None
+            )
 
             print(
                 f"[LTX23TiledSampler] AV 时间窗口内空间 tile row={region.row} col={region.col} "
@@ -185,23 +291,27 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
 
             sampled, x0 = cls._run_subsample(guider, sampler, sigmas, nested_samples, nested_noise, nested_mask, seed)
             sampled_video, sampled_audio = split_av_components(sampled)
+            if causal_fix:
+                sampled_video = strip_first_temporal_slice(sampled_video, dim=2)
             video_tile_outputs.append((region, sampled_video))
+            if audio_output is None:
+                audio_output = sampled_audio
             if x0 is not None:
                 x0_video, x0_audio = split_av_components(x0)
+                if causal_fix:
+                    x0_video = strip_first_temporal_slice(x0_video, dim=2)
                 video_x0_outputs.append((region, x0_video))
                 if audio_x0_output is None:
                     audio_x0_output = x0_audio
-            if audio_output is None:
-                audio_output = sampled_audio
 
         blended_video = blend_tiles(
-            (video_samples.shape[0], video_samples.shape[1], video_samples.shape[2], height, width),
+            (base_video_shape[0], base_video_shape[1], base_video_shape[2], base_video_shape[3], base_video_shape[4]),
             video_tile_outputs,
         )
         blended_x0 = None
         if audio_x0_output is not None and len(video_x0_outputs) == len(video_tile_outputs):
             blended_x0_video = blend_tiles(
-                (video_samples.shape[0], video_samples.shape[1], video_samples.shape[2], height, width),
+                (base_video_shape[0], base_video_shape[1], base_video_shape[2], base_video_shape[3], base_video_shape[4]),
                 video_x0_outputs,
             )
             blended_x0 = make_nested(blended_x0_video, audio_x0_output)
@@ -236,7 +346,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             )
             window_samples, window_noise, window_mask = slice_video_window_payload(samples, full_noise, noise_mask, window)
             chunk_samples, chunk_x0 = cls._sample_video_window(
-                guider, sampler, sigmas, window_samples, window_noise, window_mask, latent_tile, latent_overlap, seed
+                guider, sampler, sigmas, window_samples, window_noise, window_mask, latent_tile, latent_overlap, seed, causal_fix=not window.is_first
             )
             out_parts.append(chunk_samples[:, :, window.retain_start:window.retain_end])
             if chunk_x0 is None:
@@ -264,7 +374,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             )
             payload = build_av_window_payload(samples, full_noise, noise_mask, window)
             chunk_samples, chunk_x0 = cls._sample_av_window(
-                guider, sampler, sigmas, payload, latent_tile, latent_overlap, seed
+                guider, sampler, sigmas, payload, latent_tile, latent_overlap, seed, causal_fix=not window.is_first
             )
             chunk_video, chunk_audio = split_av_components(chunk_samples)
             out_video_parts.append(chunk_video[:, :, window.retain_start:window.retain_end])
@@ -333,10 +443,12 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         out = latent.copy()
         out.pop("downscale_ratio_spacial", None)
         out.pop("downscale_ratio_temporal", None)
+        samples = cls._normalize_output_structure(samples, latent_kind, fixed_samples)
         out["samples"] = move_to_device(samples, comfy.model_management.intermediate_device())
 
         if x0 is not None:
             out_denoised = latent.copy()
+            x0 = cls._normalize_output_structure(x0, latent_kind, fixed_samples)
             out_denoised["samples"] = move_to_device(x0, comfy.model_management.intermediate_device())
         else:
             out_denoised = out

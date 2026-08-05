@@ -85,6 +85,21 @@ def _slice_time(tensor: torch.Tensor, start: int, end: int, dim: int = 2) -> tor
     return tensor[tuple(index)]
 
 
+def prepend_first_temporal_slice(tensor: torch.Tensor | None, dim: int = 2):
+    if tensor is None:
+        return None
+    first = _slice_time(tensor, 0, 1, dim=dim)
+    return torch.cat([first, tensor], dim=dim)
+
+
+def strip_first_temporal_slice(tensor: torch.Tensor | None, dim: int = 2):
+    if tensor is None:
+        return None
+    if tensor.shape[dim] <= 1:
+        raise ValueError("无法移除时间首帧，占位帧长度不足。")
+    return _slice_time(tensor, 1, tensor.shape[dim], dim=dim)
+
+
 def _slice_video_spatial(tensor: torch.Tensor, v_start: int, v_end: int, h_start: int, h_end: int) -> torch.Tensor:
     if tensor.ndim < 5:
         return tensor
