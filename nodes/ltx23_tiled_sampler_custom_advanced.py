@@ -8,6 +8,7 @@ import comfy.utils
 import comfy.nested_tensor
 import latent_preview
 import nodes as comfy_nodes
+from tqdm import tqdm
 
 from ..utils.latent_ops import (
     build_av_window_payload,
@@ -25,11 +26,12 @@ from ..utils.tile_blending import blend_tiles, build_spatial_tiles
 
 
 class _GlobalSamplerProgress:
-    def __init__(self, model_patcher, total_steps: int):
+    def __init__(self, model_patcher, total_steps: int, node_id: str | None = None):
         self.total_steps = max(1, int(total_steps))
         self.current_step = 0
         self.preview_format = "JPEG"
-        self.progress_bar = comfy.utils.ProgressBar(self.total_steps)
+        self.progress_bar = comfy.utils.ProgressBar(self.total_steps, node_id=node_id)
+        self.console_progress = tqdm(total=self.total_steps, desc="LTX23TiledSampler", unit="steps", leave=True)
         self.previewer = latent_preview.get_previewer(model_patcher.load_device, model_patcher.model.latent_format)
 
     def reserve_subsample(self, local_steps: int, count_towards_total: bool = True) -> tuple[int, int]:
@@ -50,11 +52,27 @@ class _GlobalSamplerProgress:
                 preview_bytes = self.previewer.decode_latent_to_preview_image(self.preview_format, preview_source)
 
             if count_towards_total and local_steps > 0:
-                self.progress_bar.update_absolute(start_step + step + 1, self.total_steps, preview_bytes)
+                self.update_absolute(start_step + step + 1, preview_bytes)
             elif preview_bytes is not None:
                 self.progress_bar.update_absolute(start_step, self.total_steps, preview_bytes)
 
         return callback
+
+    def update_absolute(self, value: int, preview_bytes=None):
+        value = max(0, min(int(value), self.total_steps))
+        self.progress_bar.update_absolute(value, self.total_steps, preview_bytes)
+        if self.console_progress is not None:
+            delta = value - self.console_progress.n
+            if delta > 0:
+                self.console_progress.update(delta)
+
+    def close(self):
+        if self.console_progress is not None:
+            remaining = self.total_steps - self.console_progress.n
+            if remaining > 0:
+                self.console_progress.update(remaining)
+            self.console_progress.close()
+            self.console_progress = None
 
 
 class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
@@ -105,6 +123,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                 io.Latent.Output(display_name="output"),
                 io.Latent.Output(display_name="denoised_output"),
             ],
+            hidden=[io.Hidden.unique_id],
         )
 
     @classmethod
@@ -130,10 +149,11 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
 
     @classmethod
     def _postprocess_x0(cls, guider, raw_x0, sampled):
-        x0_out = guider.model_patcher.model.process_latent_out(raw_x0.cpu())
-        if getattr(sampled, "is_nested", False):
+        x0 = raw_x0
+        if getattr(sampled, "is_nested", False) and not getattr(x0, "is_nested", False):
             latent_shapes = [x.shape for x in sampled.unbind()]
-            x0_out = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0_out, latent_shapes))
+            x0 = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0, latent_shapes))
+        x0_out = guider.model_patcher.model.process_latent_out(x0.cpu())
         return move_to_device(x0_out, comfy.model_management.intermediate_device())
 
     @classmethod
@@ -180,7 +200,9 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                 x0_output_dict=x0_output,
                 count_towards_total=count_towards_progress,
             )
-        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+        # When we aggregate progress across many sub-samples, keep the sampler's
+        # internal tqdm disabled so the console shows a single global progress bar.
+        disable_pbar = True if progress_state is not None else not comfy.utils.PROGRESS_BAR_ENABLED
         sampled = guider.sample(
             sub_noise,
             latent_samples,
@@ -568,7 +590,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return samples_out, x0_out
 
     @classmethod
-    def execute(cls, noise, guider, sampler, sigmas, latent_image, sample_frames, overlap_frames, tile_size, tile_overlap) -> io.NodeOutput:
+    def execute(cls, noise, guider, sampler, sigmas, latent_image, sample_frames, overlap_frames, tile_size, tile_overlap, unique_id=None) -> io.NodeOutput:
         if sample_frames < 1:
             raise ValueError("采样帧数必须 >= 1。")
         if overlap_frames < 0:
@@ -606,56 +628,59 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         window_count = len(build_time_windows(total_frames, sample_frames, overlap_frames))
         tile_count = len(build_spatial_tiles(latent_h, latent_w, latent_tile, latent_overlap))
         total_progress_steps = max(1, window_count * tile_count * sampler_steps)
-        progress_state = _GlobalSamplerProgress(guider.model_patcher, total_progress_steps)
+        progress_state = _GlobalSamplerProgress(guider.model_patcher, total_progress_steps, node_id=unique_id)
         print(
             f"[LTX23TiledSampler] 全局进度模式: windows={window_count} tiles_per_window={tile_count} "
             f"sampler_steps={sampler_steps} total_progress_steps={total_progress_steps}",
             flush=True,
         )
 
-        if not use_spatial_tiles and not use_time_windows:
-            print("[LTX23TiledSampler] 命中 fast path，退化为单次完整采样。", flush=True)
-            samples, x0 = cls._run_subsample(
-                guider,
-                sampler,
-                sigmas,
-                fixed_samples,
-                full_noise,
-                noise_mask,
-                noise.seed,
-                progress_state=progress_state,
-            )
-        else:
-            if latent_kind == "ltxv":
-                samples, x0 = cls._sample_video(
+        try:
+            if not use_spatial_tiles and not use_time_windows:
+                print("[LTX23TiledSampler] 命中 fast path，退化为单次完整采样。", flush=True)
+                samples, x0 = cls._run_subsample(
                     guider,
                     sampler,
                     sigmas,
                     fixed_samples,
                     full_noise,
                     noise_mask,
-                    sample_frames,
-                    overlap_frames,
-                    latent_tile,
-                    latent_overlap,
                     noise.seed,
                     progress_state=progress_state,
                 )
             else:
-                samples, x0 = cls._sample_av(
-                    guider,
-                    sampler,
-                    sigmas,
-                    fixed_samples,
-                    full_noise,
-                    noise_mask,
-                    sample_frames,
-                    overlap_frames,
-                    latent_tile,
-                    latent_overlap,
-                    noise.seed,
-                    progress_state=progress_state,
-                )
+                if latent_kind == "ltxv":
+                    samples, x0 = cls._sample_video(
+                        guider,
+                        sampler,
+                        sigmas,
+                        fixed_samples,
+                        full_noise,
+                        noise_mask,
+                        sample_frames,
+                        overlap_frames,
+                        latent_tile,
+                        latent_overlap,
+                        noise.seed,
+                        progress_state=progress_state,
+                    )
+                else:
+                    samples, x0 = cls._sample_av(
+                        guider,
+                        sampler,
+                        sigmas,
+                        fixed_samples,
+                        full_noise,
+                        noise_mask,
+                        sample_frames,
+                        overlap_frames,
+                        latent_tile,
+                        latent_overlap,
+                        noise.seed,
+                        progress_state=progress_state,
+                    )
+        finally:
+            progress_state.close()
 
         out = latent.copy()
         out.pop("downscale_ratio_spacial", None)
