@@ -80,7 +80,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="LTX23TiledSamplerCustomAdvanced",
-            display_name="LTX2.3 Tiled Sampler Custom Advanced",
+            display_name="LTX2.3自定义采样器(分片)",
             category="model/sampling/custom",
             inputs=[
                 io.Noise.Input("noise"),
