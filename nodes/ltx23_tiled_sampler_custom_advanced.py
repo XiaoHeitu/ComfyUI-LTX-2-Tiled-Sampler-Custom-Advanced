@@ -24,6 +24,39 @@ from ..utils.latent_ops import (
 from ..utils.tile_blending import blend_tiles, build_spatial_tiles
 
 
+class _GlobalSamplerProgress:
+    def __init__(self, model_patcher, total_steps: int):
+        self.total_steps = max(1, int(total_steps))
+        self.current_step = 0
+        self.preview_format = "JPEG"
+        self.progress_bar = comfy.utils.ProgressBar(self.total_steps)
+        self.previewer = latent_preview.get_previewer(model_patcher.load_device, model_patcher.model.latent_format)
+
+    def reserve_subsample(self, local_steps: int, count_towards_total: bool = True) -> tuple[int, int]:
+        local_steps = max(0, int(local_steps))
+        start_step = self.current_step
+        if count_towards_total:
+            self.current_step += local_steps
+        return start_step, local_steps
+
+    def build_callback(self, start_step: int, local_steps: int, x0_output_dict=None, count_towards_total: bool = True):
+        def callback(step, x0, x, total_steps):
+            if x0_output_dict is not None:
+                x0_output_dict["x0"] = x0
+
+            preview_bytes = None
+            if self.previewer is not None:
+                preview_source = x0.tensors[0] if getattr(x0, "is_nested", False) else x0
+                preview_bytes = self.previewer.decode_latent_to_preview_image(self.preview_format, preview_source)
+
+            if count_towards_total and local_steps > 0:
+                self.progress_bar.update_absolute(start_step + step + 1, self.total_steps, preview_bytes)
+            elif preview_bytes is not None:
+                self.progress_bar.update_absolute(start_step, self.total_steps, preview_bytes)
+
+        return callback
+
+
 class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -116,9 +149,30 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return make_nested(rebuilt[0], rebuilt[1])
 
     @classmethod
-    def _run_subsample(cls, guider, sampler, sigmas, latent_samples, sub_noise, sub_mask, seed):
+    def _run_subsample(
+        cls,
+        guider,
+        sampler,
+        sigmas,
+        latent_samples,
+        sub_noise,
+        sub_mask,
+        seed,
+        progress_state: _GlobalSamplerProgress | None = None,
+        count_towards_progress: bool = True,
+    ):
         x0_output = {}
-        callback = latent_preview.prepare_callback(guider.model_patcher, sigmas.shape[-1] - 1, x0_output)
+        local_steps = max(0, int(sigmas.shape[-1] - 1))
+        if progress_state is None:
+            callback = latent_preview.prepare_callback(guider.model_patcher, local_steps, x0_output)
+        else:
+            start_step, reserved_steps = progress_state.reserve_subsample(local_steps, count_towards_total=count_towards_progress)
+            callback = progress_state.build_callback(
+                start_step,
+                reserved_steps,
+                x0_output_dict=x0_output,
+                count_towards_total=count_towards_progress,
+            )
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         sampled = guider.sample(
             sub_noise,
@@ -153,7 +207,21 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         )
 
     @classmethod
-    def _prime_window_audio(cls, guider, sampler, sigmas, video_samples, video_noise, video_mask, audio_samples, audio_noise, audio_mask, region, seed):
+    def _prime_window_audio(
+        cls,
+        guider,
+        sampler,
+        sigmas,
+        video_samples,
+        video_noise,
+        video_mask,
+        audio_samples,
+        audio_noise,
+        audio_mask,
+        region,
+        seed,
+        progress_state: _GlobalSamplerProgress | None = None,
+    ):
         tile_video_samples = slice_video_tile(video_samples, region)
         tile_video_noise = slice_video_tile(video_noise, region)
         tile_video_mask = slice_video_tile(video_mask, region) if video_mask is not None else None
@@ -165,7 +233,17 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             f"row={region.row} col={region.col}",
             flush=True,
         )
-        sampled, x0 = cls._run_subsample(guider, sampler, sigmas, nested_samples, nested_noise, nested_mask, seed)
+        sampled, x0 = cls._run_subsample(
+            guider,
+            sampler,
+            sigmas,
+            nested_samples,
+            nested_noise,
+            nested_mask,
+            seed,
+            progress_state=progress_state,
+            count_towards_progress=False,
+        )
         _, sampled_audio = split_av_components(sampled)
         x0_audio = None
         if x0 is not None:
@@ -173,7 +251,20 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return sampled_audio, x0_audio
 
     @classmethod
-    def _sample_video_window(cls, guider, sampler, sigmas, window_samples, window_noise, window_mask, latent_tile, latent_overlap, seed, causal_fix=False):
+    def _sample_video_window(
+        cls,
+        guider,
+        sampler,
+        sigmas,
+        window_samples,
+        window_noise,
+        window_mask,
+        latent_tile,
+        latent_overlap,
+        seed,
+        causal_fix=False,
+        progress_state: _GlobalSamplerProgress | None = None,
+    ):
         base_shape = tuple(window_samples.shape)
         if causal_fix:
             print("[LTX23TiledSampler] 对非首个视频时间窗口应用 LTX 首帧因果补偿。", flush=True)
@@ -197,7 +288,16 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             tile_samples = slice_video_tile(window_samples, region)
             tile_noise = slice_video_tile(window_noise, region)
             tile_mask = slice_video_tile(window_mask, region) if window_mask is not None else None
-            sampled, x0 = cls._run_subsample(guider, sampler, sigmas, tile_samples, tile_noise, tile_mask, seed)
+            sampled, x0 = cls._run_subsample(
+                guider,
+                sampler,
+                sigmas,
+                tile_samples,
+                tile_noise,
+                tile_mask,
+                seed,
+                progress_state=progress_state,
+            )
             if causal_fix:
                 sampled = strip_first_temporal_slice(sampled, dim=2)
                 if x0 is not None:
@@ -219,7 +319,18 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return blended, blended_x0
 
     @classmethod
-    def _sample_av_window(cls, guider, sampler, sigmas, payload, latent_tile, latent_overlap, seed, causal_fix=False):
+    def _sample_av_window(
+        cls,
+        guider,
+        sampler,
+        sigmas,
+        payload,
+        latent_tile,
+        latent_overlap,
+        seed,
+        causal_fix=False,
+        progress_state: _GlobalSamplerProgress | None = None,
+    ):
         video_samples = payload["video_samples"]
         audio_samples = payload["audio_samples"]
         video_noise = payload["video_noise"]
@@ -257,6 +368,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                 audio_mask,
                 regions[0],
                 seed,
+                progress_state=progress_state,
             )
             frozen_audio_mask = cls._make_frozen_audio_mask(audio_output)
         else:
@@ -289,7 +401,16 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                 flush=True,
             )
 
-            sampled, x0 = cls._run_subsample(guider, sampler, sigmas, nested_samples, nested_noise, nested_mask, seed)
+            sampled, x0 = cls._run_subsample(
+                guider,
+                sampler,
+                sigmas,
+                nested_samples,
+                nested_noise,
+                nested_mask,
+                seed,
+                progress_state=progress_state,
+            )
             sampled_video, sampled_audio = split_av_components(sampled)
             if causal_fix:
                 sampled_video = strip_first_temporal_slice(sampled_video, dim=2)
@@ -332,7 +453,20 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return torch.cat(parts, dim=2)
 
     @classmethod
-    def _sample_video(cls, guider, sampler, sigmas, samples, full_noise, noise_mask, sample_frames, latent_tile, latent_overlap, seed):
+    def _sample_video(
+        cls,
+        guider,
+        sampler,
+        sigmas,
+        samples,
+        full_noise,
+        noise_mask,
+        sample_frames,
+        latent_tile,
+        latent_overlap,
+        seed,
+        progress_state: _GlobalSamplerProgress | None = None,
+    ):
         windows = build_time_windows(samples.shape[2], sample_frames, sample_frames * 2)
         out_parts = []
         x0_parts = []
@@ -346,7 +480,17 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             )
             window_samples, window_noise, window_mask = slice_video_window_payload(samples, full_noise, noise_mask, window)
             chunk_samples, chunk_x0 = cls._sample_video_window(
-                guider, sampler, sigmas, window_samples, window_noise, window_mask, latent_tile, latent_overlap, seed, causal_fix=not window.is_first
+                guider,
+                sampler,
+                sigmas,
+                window_samples,
+                window_noise,
+                window_mask,
+                latent_tile,
+                latent_overlap,
+                seed,
+                causal_fix=not window.is_first,
+                progress_state=progress_state,
             )
             out_parts.append(chunk_samples[:, :, window.retain_start:window.retain_end])
             if chunk_x0 is None:
@@ -357,7 +501,20 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return cls._concat_time(out_parts), cls._concat_time(x0_parts) if has_x0 and x0_parts else None
 
     @classmethod
-    def _sample_av(cls, guider, sampler, sigmas, samples, full_noise, noise_mask, sample_frames, latent_tile, latent_overlap, seed):
+    def _sample_av(
+        cls,
+        guider,
+        sampler,
+        sigmas,
+        samples,
+        full_noise,
+        noise_mask,
+        sample_frames,
+        latent_tile,
+        latent_overlap,
+        seed,
+        progress_state: _GlobalSamplerProgress | None = None,
+    ):
         video_samples, _ = split_av_components(samples)
         windows = build_time_windows(video_samples.shape[2], sample_frames, sample_frames * 2)
         out_video_parts = []
@@ -374,7 +531,15 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             )
             payload = build_av_window_payload(samples, full_noise, noise_mask, window)
             chunk_samples, chunk_x0 = cls._sample_av_window(
-                guider, sampler, sigmas, payload, latent_tile, latent_overlap, seed, causal_fix=not window.is_first
+                guider,
+                sampler,
+                sigmas,
+                payload,
+                latent_tile,
+                latent_overlap,
+                seed,
+                causal_fix=not window.is_first,
+                progress_state=progress_state,
             )
             chunk_video, chunk_audio = split_av_components(chunk_samples)
             out_video_parts.append(chunk_video[:, :, window.retain_start:window.retain_end])
@@ -426,18 +591,57 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         use_time_windows = sample_frames < total_frames
 
         full_noise = noise.generate_noise(latent)
+        sampler_steps = max(0, int(sigmas.shape[-1] - 1))
+        window_count = len(build_time_windows(total_frames, sample_frames, sample_frames * 2))
+        tile_count = len(build_spatial_tiles(latent_h, latent_w, latent_tile, latent_overlap))
+        total_progress_steps = max(1, window_count * tile_count * sampler_steps)
+        progress_state = _GlobalSamplerProgress(guider.model_patcher, total_progress_steps)
+        print(
+            f"[LTX23TiledSampler] 全局进度模式: windows={window_count} tiles_per_window={tile_count} "
+            f"sampler_steps={sampler_steps} total_progress_steps={total_progress_steps}",
+            flush=True,
+        )
 
         if not use_spatial_tiles and not use_time_windows:
             print("[LTX23TiledSampler] 命中 fast path，退化为单次完整采样。", flush=True)
-            samples, x0 = cls._run_subsample(guider, sampler, sigmas, fixed_samples, full_noise, noise_mask, noise.seed)
+            samples, x0 = cls._run_subsample(
+                guider,
+                sampler,
+                sigmas,
+                fixed_samples,
+                full_noise,
+                noise_mask,
+                noise.seed,
+                progress_state=progress_state,
+            )
         else:
             if latent_kind == "ltxv":
                 samples, x0 = cls._sample_video(
-                    guider, sampler, sigmas, fixed_samples, full_noise, noise_mask, sample_frames, latent_tile, latent_overlap, noise.seed
+                    guider,
+                    sampler,
+                    sigmas,
+                    fixed_samples,
+                    full_noise,
+                    noise_mask,
+                    sample_frames,
+                    latent_tile,
+                    latent_overlap,
+                    noise.seed,
+                    progress_state=progress_state,
                 )
             else:
                 samples, x0 = cls._sample_av(
-                    guider, sampler, sigmas, fixed_samples, full_noise, noise_mask, sample_frames, latent_tile, latent_overlap, noise.seed
+                    guider,
+                    sampler,
+                    sigmas,
+                    fixed_samples,
+                    full_noise,
+                    noise_mask,
+                    sample_frames,
+                    latent_tile,
+                    latent_overlap,
+                    noise.seed,
+                    progress_state=progress_state,
                 )
 
         out = latent.copy()
