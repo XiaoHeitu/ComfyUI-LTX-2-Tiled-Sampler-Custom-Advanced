@@ -75,11 +75,18 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                     default=32,
                     min=1,
                     max=4096,
-                    tooltip="每个后续时间窗口新增的 latent 帧数。内部会自动使用 2 倍该值作为隐藏重叠帧数。",
+                    tooltip="每个后续时间窗口新增的 latent 帧数。",
+                ),
+                io.Int.Input(
+                    "overlap_frames",
+                    default=4,
+                    min=0,
+                    max=4096,
+                    tooltip="时间窗口之间回看的 latent 重叠帧数。",
                 ),
                 io.Int.Input(
                     "tile_size",
-                    default=320,
+                    default=512,
                     min=32,
                     max=comfy_nodes.MAX_RESOLUTION,
                     step=8,
@@ -87,7 +94,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "tile_overlap",
-                    default=40,
+                    default=192,
                     min=0,
                     max=comfy_nodes.MAX_RESOLUTION,
                     step=8,
@@ -462,12 +469,13 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         full_noise,
         noise_mask,
         sample_frames,
+        overlap_frames,
         latent_tile,
         latent_overlap,
         seed,
         progress_state: _GlobalSamplerProgress | None = None,
     ):
-        windows = build_time_windows(samples.shape[2], sample_frames, sample_frames * 2)
+        windows = build_time_windows(samples.shape[2], sample_frames, overlap_frames)
         out_parts = []
         x0_parts = []
         has_x0 = True
@@ -510,13 +518,14 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         full_noise,
         noise_mask,
         sample_frames,
+        overlap_frames,
         latent_tile,
         latent_overlap,
         seed,
         progress_state: _GlobalSamplerProgress | None = None,
     ):
         video_samples, _ = split_av_components(samples)
-        windows = build_time_windows(video_samples.shape[2], sample_frames, sample_frames * 2)
+        windows = build_time_windows(video_samples.shape[2], sample_frames, overlap_frames)
         out_video_parts = []
         out_audio_parts = []
         x0_video_parts = []
@@ -559,9 +568,11 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         return samples_out, x0_out
 
     @classmethod
-    def execute(cls, noise, guider, sampler, sigmas, latent_image, sample_frames, tile_size, tile_overlap) -> io.NodeOutput:
+    def execute(cls, noise, guider, sampler, sigmas, latent_image, sample_frames, overlap_frames, tile_size, tile_overlap) -> io.NodeOutput:
         if sample_frames < 1:
             raise ValueError("采样帧数必须 >= 1。")
+        if overlap_frames < 0:
+            raise ValueError("时间重叠帧数必须 >= 0。")
 
         latent = latent_image.copy()
         fixed_samples = comfy.sample.fix_empty_latent_channels(
@@ -592,7 +603,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
 
         full_noise = noise.generate_noise(latent)
         sampler_steps = max(0, int(sigmas.shape[-1] - 1))
-        window_count = len(build_time_windows(total_frames, sample_frames, sample_frames * 2))
+        window_count = len(build_time_windows(total_frames, sample_frames, overlap_frames))
         tile_count = len(build_spatial_tiles(latent_h, latent_w, latent_tile, latent_overlap))
         total_progress_steps = max(1, window_count * tile_count * sampler_steps)
         progress_state = _GlobalSamplerProgress(guider.model_patcher, total_progress_steps)
@@ -624,6 +635,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                     full_noise,
                     noise_mask,
                     sample_frames,
+                    overlap_frames,
                     latent_tile,
                     latent_overlap,
                     noise.seed,
@@ -638,6 +650,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                     full_noise,
                     noise_mask,
                     sample_frames,
+                    overlap_frames,
                     latent_tile,
                     latent_overlap,
                     noise.seed,

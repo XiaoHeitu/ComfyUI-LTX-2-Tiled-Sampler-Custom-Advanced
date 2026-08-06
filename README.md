@@ -21,16 +21,21 @@
 - `sample_frames` / `采样帧数`
   - 默认：`32`
   - 单位：`latent 帧`
-  - 含义：首个时间窗口最多处理 `3 * sample_frames` 帧；后续每个时间窗口新增 `sample_frames` 帧
+  - 含义：每个后续时间窗口新增的 latent 帧数
+
+- `overlap_frames` / `时间重叠`
+  - 默认：`4`
+  - 单位：`latent 帧`
+  - 含义：时间窗口之间回看的历史帧数
 
 - `tile_size` / `分片像素`
-  - 默认：`320`
+  - 默认：`512`
   - 单位：`像素`
   - 含义：空间分片大小
   - 内部会根据 latent 的空间缩放比例转换到 latent 空间
 
 - `tile_overlap` / `重合像素`
-  - 默认：`40`
+  - 默认：`192`
   - 单位：`像素`
   - 含义：空间分片之间的重叠宽度
   - 内部会根据 latent 的空间缩放比例转换到 latent 空间
@@ -38,17 +43,15 @@
 
 ## 时间窗口规则
 
-- 节点不暴露单独的时间重叠参数
-- 内部固定使用：
-  - `overlap_frames = sample_frames * 2`
-- 因此窗口长度实际为：
-  - `window_frames = sample_frames + overlap_frames = 3 * sample_frames`
+- 节点显式暴露 `overlap_frames`
+- 时间窗口长度为：
+  - `window_frames = sample_frames + overlap_frames`
 
-例如当 `sample_frames = 32` 时：
+例如当 `sample_frames = 32`、`overlap_frames = 4` 时：
 
-- 首个时间窗口最多处理 `96` 帧
+- 首个时间窗口最多处理 `36` 帧
 - 之后每个时间窗口新增 `32` 帧
-- 每个后续窗口会回看前面 `64` 帧历史
+- 每个后续窗口会回看前面 `4` 帧历史
 
 对于非首个时间窗口，代码会在视频分支前面额外补入一帧首时间切片，再在输出时移除，用于做当前实现中的 LTX 首帧因果补偿。
 
@@ -64,7 +67,7 @@
 原生节点是一次性对整段 latent 做采样；本插件的执行逻辑是：
 
 1. 先为完整 latent 生成一次噪声
-2. 根据 `sample_frames` 构造时间窗口
+2. 根据 `sample_frames` 和 `overlap_frames` 构造时间窗口
 3. 每个时间窗口内按需决定是否继续做空间切块
 4. 空间 tile 输出经权重融合后回写当前窗口
 5. 仅保留每个窗口的新增区域，再按时间顺序拼接成完整输出
