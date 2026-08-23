@@ -100,6 +100,39 @@ def strip_first_temporal_slice(tensor: torch.Tensor | None, dim: int = 2):
     return _slice_time(tensor, 1, tensor.shape[dim], dim=dim)
 
 
+def _make_temporal_mask_like(reference: torch.Tensor, dim: int = 2) -> torch.Tensor:
+    shape = list(reference.shape)
+    if len(shape) < 3:
+        raise ValueError("时间 mask 至少需要 batch/channel/time 三个维度。")
+    shape[1] = 1
+    for index in range(3, len(shape)):
+        shape[index] = 1
+    return torch.ones(tuple(shape), dtype=torch.float32, device=reference.device)
+
+
+def freeze_temporal_history(reference: torch.Tensor, base_mask: torch.Tensor | None, history_frames: int, dim: int = 2):
+    if history_frames <= 0:
+        return base_mask
+
+    mask = base_mask.clone() if base_mask is not None else _make_temporal_mask_like(reference, dim=dim)
+    frozen = max(0, min(int(history_frames), mask.shape[dim]))
+    if frozen <= 0:
+        return mask
+
+    index = [slice(None)] * mask.ndim
+    index[dim] = slice(0, frozen)
+    mask[tuple(index)] = 0
+    return mask
+
+
+def replace_time_slice(tensor: torch.Tensor, start: int, end: int, value: torch.Tensor, dim: int = 2) -> torch.Tensor:
+    updated = tensor.clone()
+    index = [slice(None)] * updated.ndim
+    index[dim] = slice(start, end)
+    updated[tuple(index)] = value
+    return updated
+
+
 def _slice_video_spatial(tensor: torch.Tensor, v_start: int, v_end: int, h_start: int, h_end: int) -> torch.Tensor:
     if tensor.ndim < 5:
         return tensor
@@ -183,6 +216,10 @@ def build_av_window_payload(samples, noise, noise_mask, window: TimeWindow):
     audio_retain_end = audio_retain_start + (a_added_end - a_added_start)
 
     return {
+        "video_history_start": window.history_start,
+        "video_end": window.end,
+        "audio_history_start": a_history_start,
+        "audio_end": a_end,
         "video_samples": _slice_time(video_samples, window.history_start, window.end, dim=2),
         "audio_samples": _slice_time(audio_samples, a_history_start, a_end, dim=2),
         "video_noise": _slice_time(video_noise, window.history_start, window.end, dim=2),
@@ -200,3 +237,27 @@ def slice_video_tile(tensor: torch.Tensor, region) -> torch.Tensor:
 
 def make_nested(video_tensor: torch.Tensor, audio_tensor: torch.Tensor):
     return comfy.nested_tensor.NestedTensor((video_tensor, audio_tensor))
+
+
+def update_video_window_context(samples: torch.Tensor, window: TimeWindow, chunk_samples: torch.Tensor) -> torch.Tensor:
+    return replace_time_slice(samples, window.history_start, window.end, chunk_samples, dim=2)
+
+
+def update_av_window_context(samples, payload: dict, chunk_samples):
+    video_samples, audio_samples = split_av_components(samples)
+    chunk_video, chunk_audio = split_av_components(chunk_samples)
+    video_updated = replace_time_slice(
+        video_samples,
+        payload["video_history_start"],
+        payload["video_end"],
+        chunk_video,
+        dim=2,
+    )
+    audio_updated = replace_time_slice(
+        audio_samples,
+        payload["audio_history_start"],
+        payload["audio_end"],
+        chunk_audio,
+        dim=2,
+    )
+    return make_nested(video_updated, audio_updated)

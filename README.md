@@ -1,6 +1,6 @@
-# ComfyUI LTX2.3 Tiled Sampler Custom Advanced
+# ComfyUI LTX2 Tiled Sampler Custom Advanced
 
-一个独立的 ComfyUI 自定义节点插件，用于在 LTX 2.3 工作流中替代原生 `SamplerCustomAdvanced`，并增加时间窗口采样与空间切块能力。
+一个独立的 ComfyUI 自定义节点插件，用于在 LTX 2 系列工作流中替代原生 `SamplerCustomAdvanced`，并增加时间窗口采样与空间切块能力。
 
 ## 实测性能
 
@@ -21,6 +21,12 @@
 
 ![RTX 3070 Benchmark](./assets/benchmark_rtx3070.svg)
 
+## 支持版本
+
+- 已验证：`LTX 2.3`、`LTX 2.5`
+- 预期兼容：其他 `LTX 2.x` 系列版本
+- 说明：只要底层 latent 结构、采样接口以及 `LTXV` / `LTXAV` 输入约定保持兼容，本节点通常无需修改即可工作；不同版本仍建议先做一轮实际生成验证。
+
 ## 功能
 
 - 保持原始 `SamplerCustomAdvanced` 的输入输出契约
@@ -31,8 +37,8 @@
 
 ## 节点
 
-- 节点名：`LTX23TiledSamplerCustomAdvanced`
-- 显示名：`LTX2.3 Tiled Sampler Custom Advanced`
+- 节点名：`LTX2TiledSamplerCustomAdvanced`
+- 显示名：`LTX2 Tiled Sampler Custom Advanced`
 - 分类：`model/sampling/custom`
 
 ## 参数
@@ -71,6 +77,7 @@
 - 首个时间窗口最多处理 `36` 帧
 - 之后每个时间窗口新增 `32` 帧
 - 每个后续窗口会回看前面 `4` 帧历史
+- 后续窗口会先复用上一窗口已经生成好的历史 latent，再把这段历史作为冻结上下文，仅继续更新新增帧
 
 对于非首个时间窗口，代码会在视频分支前面额外补入一帧首时间切片，再在输出时移除，用于做当前实现中的 LTX 首帧因果补偿。
 

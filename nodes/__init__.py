@@ -1,3 +1,3 @@
-from .ltx23_tiled_sampler_custom_advanced import LTX23TiledSamplerCustomAdvanced
+from .ltx2_tiled_sampler_custom_advanced import LTX2TiledSamplerCustomAdvanced
 
-__all__ = ["LTX23TiledSamplerCustomAdvanced"]
+__all__ = ["LTX2TiledSamplerCustomAdvanced"]

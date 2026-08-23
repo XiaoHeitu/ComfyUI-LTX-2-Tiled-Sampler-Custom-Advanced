@@ -1,15 +1,15 @@
 from comfy_api.latest import ComfyExtension
 
-from .nodes import LTX23TiledSamplerCustomAdvanced
+from .nodes import LTX2TiledSamplerCustomAdvanced
 
 
-class LTX23TiledSamplerExtension(ComfyExtension):
+class LTX2TiledSamplerExtension(ComfyExtension):
     async def get_node_list(self) -> list[type]:
-        return [LTX23TiledSamplerCustomAdvanced]
+        return [LTX2TiledSamplerCustomAdvanced]
 
 
-async def comfy_entrypoint() -> LTX23TiledSamplerExtension:
-    return LTX23TiledSamplerExtension()
+async def comfy_entrypoint() -> LTX2TiledSamplerExtension:
+    return LTX2TiledSamplerExtension()
 
 
-__all__ = ["comfy_entrypoint", "LTX23TiledSamplerExtension", "LTX23TiledSamplerCustomAdvanced"]
+__all__ = ["comfy_entrypoint", "LTX2TiledSamplerExtension", "LTX2TiledSamplerCustomAdvanced"]

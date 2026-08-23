@@ -1,7 +1,7 @@
 <svg width="1200" height="640" viewBox="0 0 1200 640" fill="none" xmlns="http://www.w3.org/2000/svg">
   <rect width="1200" height="640" rx="24" fill="#0F172A"/>
   <text x="60" y="78" fill="#F8FAFC" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700">
-    LTX 2.3 1920x1024 / 30fps / 8s 实测对比
+    LTX 2 1920x1024 / 30fps / 8s 实测对比
   </text>
   <text x="60" y="116" fill="#94A3B8" font-family="Arial, Helvetica, sans-serif" font-size="20">
     RTX 3070 8GB VRAM / 32GB RAM / sample_frames=32 / overlap_frames=2 / tile_size=480 / tile_overlap=192

@@ -14,6 +14,7 @@ from ..utils.latent_ops import (
     build_av_window_payload,
     build_time_windows,
     detect_latent_kind,
+    freeze_temporal_history,
     make_nested,
     move_to_device,
     prepend_first_temporal_slice,
@@ -21,6 +22,8 @@ from ..utils.latent_ops import (
     slice_video_window_payload,
     split_av_components,
     strip_first_temporal_slice,
+    update_av_window_context,
+    update_video_window_context,
 )
 from ..utils.tile_blending import blend_tiles, build_spatial_tiles
 
@@ -31,7 +34,7 @@ class _GlobalSamplerProgress:
         self.current_step = 0
         self.preview_format = "JPEG"
         self.progress_bar = comfy.utils.ProgressBar(self.total_steps, node_id=node_id)
-        self.console_progress = tqdm(total=self.total_steps, desc="LTX23TiledSampler", unit="steps", leave=True)
+        self.console_progress = tqdm(total=self.total_steps, desc="LTX2TiledSampler", unit="steps", leave=True)
         self.previewer = latent_preview.get_previewer(model_patcher.load_device, model_patcher.model.latent_format)
 
     def reserve_subsample(self, local_steps: int, count_towards_total: bool = True) -> tuple[int, int]:
@@ -75,12 +78,12 @@ class _GlobalSamplerProgress:
             self.console_progress = None
 
 
-class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
+class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="LTX23TiledSamplerCustomAdvanced",
-            display_name="LTX2.3自定义采样器(分片)",
+            node_id="LTX2TiledSamplerCustomAdvanced",
+            display_name="LTX2自定义采样器(分片)",
             category="model/sampling/custom",
             inputs=[
                 io.Noise.Input("noise"),
@@ -172,7 +175,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         rebuilt = comfy.utils.unpack_latents(value, [ref_video.shape, ref_audio.shape])
         if len(rebuilt) != 2:
             raise ValueError(f"LTXAV 输出重建失败，期望 2 个分支，当前得到 {len(rebuilt)} 个。")
-        print("[LTX23TiledSampler] 检测到 AV 输出为普通 tensor，已按原始分支形状重建为 NestedTensor。", flush=True)
+        print("[LTX2TiledSampler] 检测到 AV 输出为普通 tensor，已按原始分支形状重建为 NestedTensor。", flush=True)
         return make_nested(rebuilt[0], rebuilt[1])
 
     @classmethod
@@ -258,7 +261,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         nested_noise = make_nested(tile_video_noise, audio_noise)
         nested_mask = make_nested(tile_video_mask, audio_mask) if (tile_video_mask is not None or audio_mask is not None) else None
         print(
-            f"[LTX23TiledSampler] 使用首个 tile 预生成当前时间窗口的冻结音频 "
+            f"[LTX2TiledSampler] 使用首个 tile 预生成当前时间窗口的冻结音频 "
             f"row={region.row} col={region.col}",
             flush=True,
         )
@@ -296,7 +299,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
     ):
         base_shape = tuple(window_samples.shape)
         if causal_fix:
-            print("[LTX23TiledSampler] 对非首个视频时间窗口应用 LTX 首帧因果补偿。", flush=True)
+            print("[LTX2TiledSampler] 对非首个视频时间窗口应用 LTX 首帧因果补偿。", flush=True)
             window_samples = prepend_first_temporal_slice(window_samples, dim=2)
             window_noise = prepend_first_temporal_slice(window_noise, dim=2)
             window_mask = prepend_first_temporal_slice(window_mask, dim=2) if window_mask is not None else None
@@ -310,7 +313,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
 
         for region in regions:
             print(
-                f"[LTX23TiledSampler] 时间窗口内空间 tile row={region.row} col={region.col} "
+                f"[LTX2TiledSampler] 时间窗口内空间 tile row={region.row} col={region.col} "
                 f"v=({region.v_start}:{region.v_end}) h=({region.h_start}:{region.h_end})",
                 flush=True,
             )
@@ -369,7 +372,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         base_video_shape = tuple(video_samples.shape)
 
         if causal_fix:
-            print("[LTX23TiledSampler] 对非首个 AV 时间窗口应用 LTX 首帧因果补偿。", flush=True)
+            print("[LTX2TiledSampler] 对非首个 AV 时间窗口应用 LTX 首帧因果补偿。", flush=True)
             video_samples = prepend_first_temporal_slice(video_samples, dim=2)
             video_noise = prepend_first_temporal_slice(video_noise, dim=2)
             video_mask = prepend_first_temporal_slice(video_mask, dim=2) if video_mask is not None else None
@@ -384,7 +387,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         audio_x0_output = None
 
         if len(regions) > 1:
-            print("[LTX23TiledSampler] LTXAV 模式下先为当前时间窗口生成冻结音频，再对视频分支做空间切块。", flush=True)
+            print("[LTX2TiledSampler] LTXAV 模式下先为当前时间窗口生成冻结音频，再对视频分支做空间切块。", flush=True)
             audio_output, audio_x0_output = cls._prime_window_audio(
                 guider,
                 sampler,
@@ -425,7 +428,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
             )
 
             print(
-                f"[LTX23TiledSampler] AV 时间窗口内空间 tile row={region.row} col={region.col} "
+                f"[LTX2TiledSampler] AV 时间窗口内空间 tile row={region.row} col={region.col} "
                 f"v=({region.v_start}:{region.v_end}) h=({region.h_start}:{region.h_end})",
                 flush=True,
             )
@@ -498,17 +501,25 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         progress_state: _GlobalSamplerProgress | None = None,
     ):
         windows = build_time_windows(samples.shape[2], sample_frames, overlap_frames)
+        current_samples = samples
         out_parts = []
         x0_parts = []
         has_x0 = True
 
         for window in windows:
             print(
-                f"[LTX23TiledSampler] 处理时间窗口 index={window.index} "
+                f"[LTX2TiledSampler] 处理时间窗口 index={window.index} "
                 f"range=({window.history_start}:{window.end}) retain=({window.retain_start}:{window.retain_end})",
                 flush=True,
             )
-            window_samples, window_noise, window_mask = slice_video_window_payload(samples, full_noise, noise_mask, window)
+            window_samples, window_noise, window_mask = slice_video_window_payload(current_samples, full_noise, noise_mask, window)
+            window_mask = freeze_temporal_history(window_samples, window_mask, window.retain_start, dim=2)
+            if window.retain_start > 0:
+                print(
+                    f"[LTX2TiledSampler] 时间窗口 index={window.index} 冻结前置历史帧 {window.retain_start}，"
+                    f"并复用上一窗口结果作为连续上下文。",
+                    flush=True,
+                )
             chunk_samples, chunk_x0 = cls._sample_video_window(
                 guider,
                 sampler,
@@ -522,6 +533,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                 causal_fix=not window.is_first,
                 progress_state=progress_state,
             )
+            current_samples = update_video_window_context(current_samples, window, chunk_samples)
             out_parts.append(chunk_samples[:, :, window.retain_start:window.retain_end])
             if chunk_x0 is None:
                 has_x0 = False
@@ -548,6 +560,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
     ):
         video_samples, _ = split_av_components(samples)
         windows = build_time_windows(video_samples.shape[2], sample_frames, overlap_frames)
+        current_samples = samples
         out_video_parts = []
         out_audio_parts = []
         x0_video_parts = []
@@ -556,11 +569,29 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
 
         for window in windows:
             print(
-                f"[LTX23TiledSampler] 处理 AV 时间窗口 index={window.index} "
+                f"[LTX2TiledSampler] 处理 AV 时间窗口 index={window.index} "
                 f"range=({window.history_start}:{window.end}) retain=({window.retain_start}:{window.retain_end})",
                 flush=True,
             )
-            payload = build_av_window_payload(samples, full_noise, noise_mask, window)
+            payload = build_av_window_payload(current_samples, full_noise, noise_mask, window)
+            payload["video_mask"] = freeze_temporal_history(
+                payload["video_samples"],
+                payload["video_mask"],
+                window.retain_start,
+                dim=2,
+            )
+            payload["audio_mask"] = freeze_temporal_history(
+                payload["audio_samples"],
+                payload["audio_mask"],
+                payload["audio_retain_start"],
+                dim=2,
+            )
+            if window.retain_start > 0 or payload["audio_retain_start"] > 0:
+                print(
+                    f"[LTX2TiledSampler] AV 时间窗口 index={window.index} 冻结视频历史 {window.retain_start} 帧，"
+                    f"冻结音频历史 {payload['audio_retain_start']} 帧，并复用上一窗口结果。",
+                    flush=True,
+                )
             chunk_samples, chunk_x0 = cls._sample_av_window(
                 guider,
                 sampler,
@@ -572,6 +603,7 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
                 causal_fix=not window.is_first,
                 progress_state=progress_state,
             )
+            current_samples = update_av_window_context(current_samples, payload, chunk_samples)
             chunk_video, chunk_audio = split_av_components(chunk_samples)
             out_video_parts.append(chunk_video[:, :, window.retain_start:window.retain_end])
             out_audio_parts.append(chunk_audio[:, :, payload["audio_retain_start"]:payload["audio_retain_end"]])
@@ -630,14 +662,14 @@ class LTX23TiledSamplerCustomAdvanced(io.ComfyNode):
         total_progress_steps = max(1, window_count * tile_count * sampler_steps)
         progress_state = _GlobalSamplerProgress(guider.model_patcher, total_progress_steps, node_id=unique_id)
         print(
-            f"[LTX23TiledSampler] 全局进度模式: windows={window_count} tiles_per_window={tile_count} "
+            f"[LTX2TiledSampler] 全局进度模式: windows={window_count} tiles_per_window={tile_count} "
             f"sampler_steps={sampler_steps} total_progress_steps={total_progress_steps}",
             flush=True,
         )
 
         try:
             if not use_spatial_tiles and not use_time_windows:
-                print("[LTX23TiledSampler] 命中 fast path，退化为单次完整采样。", flush=True)
+                print("[LTX2TiledSampler] 命中 fast path，退化为单次完整采样。", flush=True)
                 samples, x0 = cls._run_subsample(
                     guider,
                     sampler,
