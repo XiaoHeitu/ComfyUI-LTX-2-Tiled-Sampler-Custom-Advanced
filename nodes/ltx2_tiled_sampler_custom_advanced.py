@@ -17,11 +17,9 @@ from ..utils.latent_ops import (
     freeze_temporal_history,
     make_nested,
     move_to_device,
-    prepend_first_temporal_slice,
     slice_video_tile,
     slice_video_window_payload,
     split_av_components,
-    strip_first_temporal_slice,
     update_av_window_context,
     update_video_window_context,
 )
@@ -336,15 +334,9 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
         latent_tile,
         latent_overlap,
         seed,
-        causal_fix=False,
         progress_state: _GlobalSamplerProgress | None = None,
     ):
         base_shape = tuple(window_samples.shape)
-        if causal_fix:
-            print("[LTX2TiledSampler] 对非首个视频时间窗口应用 LTX 首帧因果补偿。", flush=True)
-            window_samples = prepend_first_temporal_slice(window_samples, dim=2)
-            window_noise = prepend_first_temporal_slice(window_noise, dim=2)
-            window_mask = prepend_first_temporal_slice(window_mask, dim=2) if window_mask is not None else None
 
         height = window_samples.shape[3]
         width = window_samples.shape[4]
@@ -372,10 +364,6 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                 seed,
                 progress_state=progress_state,
             )
-            if causal_fix:
-                sampled = strip_first_temporal_slice(sampled, dim=2)
-                if x0 is not None:
-                    x0 = strip_first_temporal_slice(x0, dim=2)
             tile_outputs.append((region, sampled))
             if x0 is not None:
                 tile_x0_outputs.append((region, x0))
@@ -402,7 +390,6 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
         latent_tile,
         latent_overlap,
         seed,
-        causal_fix=False,
         progress_state: _GlobalSamplerProgress | None = None,
     ):
         video_samples = payload["video_samples"]
@@ -412,12 +399,6 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
         video_mask = payload["video_mask"]
         audio_mask = payload["audio_mask"]
         base_video_shape = tuple(video_samples.shape)
-
-        if causal_fix:
-            print("[LTX2TiledSampler] 对非首个 AV 时间窗口应用 LTX 首帧因果补偿。", flush=True)
-            video_samples = prepend_first_temporal_slice(video_samples, dim=2)
-            video_noise = prepend_first_temporal_slice(video_noise, dim=2)
-            video_mask = prepend_first_temporal_slice(video_mask, dim=2) if video_mask is not None else None
 
         height = video_samples.shape[3]
         width = video_samples.shape[4]
@@ -486,15 +467,11 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                 progress_state=progress_state,
             )
             sampled_video, sampled_audio = split_av_components(sampled)
-            if causal_fix:
-                sampled_video = strip_first_temporal_slice(sampled_video, dim=2)
             video_tile_outputs.append((region, sampled_video))
             if audio_output is None:
                 audio_output = sampled_audio
             if x0 is not None:
                 x0_video, x0_audio = split_av_components(x0)
-                if causal_fix:
-                    x0_video = strip_first_temporal_slice(x0_video, dim=2)
                 video_x0_outputs.append((region, x0_video))
                 if audio_x0_output is None:
                     audio_x0_output = x0_audio
@@ -572,7 +549,6 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                 latent_tile,
                 latent_overlap,
                 seed,
-                causal_fix=not window.is_first,
                 progress_state=progress_state,
             )
             current_samples = update_video_window_context(current_samples, window, chunk_samples)
@@ -642,7 +618,6 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                 latent_tile,
                 latent_overlap,
                 seed,
-                causal_fix=not window.is_first,
                 progress_state=progress_state,
             )
             current_samples = update_av_window_context(current_samples, payload, chunk_samples)

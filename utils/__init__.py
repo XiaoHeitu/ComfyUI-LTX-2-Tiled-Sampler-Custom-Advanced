@@ -4,13 +4,11 @@ from .latent_ops import (
     freeze_temporal_history,
     detect_latent_kind,
     move_to_device,
-    prepend_first_temporal_slice,
     split_av_components,
     build_av_window_payload,
     update_av_window_context,
     update_video_window_context,
     slice_video_window_payload,
-    strip_first_temporal_slice,
 )
 from .tile_blending import TileRegion, build_spatial_tiles, blend_tiles
 
@@ -23,11 +21,9 @@ __all__ = [
     "freeze_temporal_history",
     "detect_latent_kind",
     "move_to_device",
-    "prepend_first_temporal_slice",
     "split_av_components",
     "build_av_window_payload",
     "update_av_window_context",
     "update_video_window_context",
     "slice_video_window_payload",
-    "strip_first_temporal_slice",
 ]

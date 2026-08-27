@@ -84,9 +84,10 @@
   - `latent_frames = ((effective_video_frames - 1) // temporal_ratio) + 1`
   - `可覆盖视频帧数 = ((latent_frames - 1) * temporal_ratio) + 1`
 - 因此用户输入值、后台实际参与换算的视频帧数，以及最终的 latent 帧数会是三套相关但不完全相同的数值
+- 首个时间窗口只生成 `sample_frames(latent)` 对应的内容，不额外吞入 overlap
+- 从第二个时间窗口开始，节点才会回看历史 latent
+- 每个后续时间窗口的历史长度为 `min(已生成长度, overlap_frames(latent))`
 - 对于后续时间窗口，节点仍会复用上一窗口已经生成好的历史 latent，再把这段历史作为冻结上下文，仅继续更新新增帧
-
-对于非首个时间窗口，代码会在视频分支前面额外补入一帧首时间切片，再在输出时移除，用于做当前实现中的 LTX 首帧因果补偿。
 
 ## 空间切块规则
 

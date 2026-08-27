@@ -45,16 +45,16 @@ def build_time_windows(total_frames: int, add_frames: int, overlap_frames: int) 
     if add_frames < 1:
         raise ValueError("采样帧数必须 >= 1。")
 
-    window_frames = add_frames + overlap_frames
-    first_end = min(total_frames, window_frames)
+    first_end = min(total_frames, add_frames)
     windows = [TimeWindow(index=0, history_start=0, end=first_end, retain_start=0, retain_end=first_end)]
 
     cursor = first_end
     index = 1
     while cursor < total_frames:
-        history_start = max(0, cursor - overlap_frames)
+        history_len = min(cursor, overlap_frames)
+        history_start = cursor - history_len
         end = min(total_frames, cursor + add_frames)
-        retain_start = cursor - history_start
+        retain_start = history_len
         retain_end = retain_start + (end - cursor)
         windows.append(
             TimeWindow(
@@ -83,21 +83,6 @@ def _slice_time(tensor: torch.Tensor, start: int, end: int, dim: int = 2) -> tor
     index = [slice(None)] * tensor.ndim
     index[dim] = slice(start, end)
     return tensor[tuple(index)]
-
-
-def prepend_first_temporal_slice(tensor: torch.Tensor | None, dim: int = 2):
-    if tensor is None:
-        return None
-    first = _slice_time(tensor, 0, 1, dim=dim)
-    return torch.cat([first, tensor], dim=dim)
-
-
-def strip_first_temporal_slice(tensor: torch.Tensor | None, dim: int = 2):
-    if tensor is None:
-        return None
-    if tensor.shape[dim] <= 1:
-        raise ValueError("无法移除时间首帧，占位帧长度不足。")
-    return _slice_time(tensor, 1, tensor.shape[dim], dim=dim)
 
 
 def _make_temporal_mask_like(reference: torch.Tensor, dim: int = 2) -> torch.Tensor:
