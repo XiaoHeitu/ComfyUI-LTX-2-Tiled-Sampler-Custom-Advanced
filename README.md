@@ -7,7 +7,8 @@
 以下为一组实际测试数据，供需要长视频生成的场景参考。
 
 - 测试硬件：`RTX 3070 8GB` 显卡，`32GB` 内存
-- 采样配置：`sample_frames=32`、`overlap_frames=2`、`tile_size=480`、`tile_overlap=192`
+- 采样配置：`sample_frames=248`、`overlap_frames=8`、`tile_size=480`、`tile_overlap=192`
+  - 注：这里填写的是前端输入值，必须为 `8` 的倍数；后台会先 `+1`，因此等价于旧配置的 `sample_frames=32`、`overlap_frames=2`（latent 帧）
 - 输出规格：`1920x1024`、`30fps`、`8秒`
 
 在上述配置下：
@@ -44,14 +45,20 @@
 ## 参数
 
 - `sample_frames` / `采样帧数`
-  - 默认：`32`
-  - 单位：`latent 帧`
-  - 含义：每个后续时间窗口新增的 latent 帧数
+  - 默认：`248`
+  - 单位：`视频帧`
+  - 含义：每个后续时间窗口新增的视频帧数
+  - 输入必须为 `8` 的倍数
+  - 后台会先对输入值执行 `+1`，再按 LTX 时间缩放比例转换到 latent 时间轴
+  - 默认值按 `temporal_ratio=8` 折算后，等价于旧版默认 `32 latent 帧`
 
 - `overlap_frames` / `时间重叠`
-  - 默认：`4`
-  - 单位：`latent 帧`
-  - 含义：时间窗口之间回看的历史帧数
+  - 默认：`24`
+  - 单位：`视频帧`
+  - 含义：时间窗口之间回看的历史视频帧数
+  - 输入必须为 `8` 的倍数
+  - 后台会先对输入值执行 `+1`，再按 LTX 时间缩放比例转换到 latent 时间轴
+  - 默认值按 `temporal_ratio=8` 折算后，等价于旧版默认 `4 latent 帧`
 
 - `tile_size` / `分片像素`
   - 默认：`512`
@@ -69,15 +76,15 @@
 ## 时间窗口规则
 
 - 节点显式暴露 `overlap_frames`
-- 时间窗口长度为：
-  - `window_frames = sample_frames + overlap_frames`
-
-例如当 `sample_frames = 32`、`overlap_frames = 4` 时：
-
-- 首个时间窗口最多处理 `36` 帧
-- 之后每个时间窗口新增 `32` 帧
-- 每个后续窗口会回看前面 `4` 帧历史
-- 后续窗口会先复用上一窗口已经生成好的历史 latent，再把这段历史作为冻结上下文，仅继续更新新增帧
+- `sample_frames` 与 `overlap_frames` 现在都直接输入视频帧数
+- 输入值必须为 `8` 的倍数
+- 后台会先执行：
+  - `effective_video_frames = input_video_frames + 1`
+- 再按 LTX 的时间缩放比例换算到 latent 时间轴：
+  - `latent_frames = ((effective_video_frames - 1) // temporal_ratio) + 1`
+  - `可覆盖视频帧数 = ((latent_frames - 1) * temporal_ratio) + 1`
+- 因此用户输入值、后台实际参与换算的视频帧数，以及最终的 latent 帧数会是三套相关但不完全相同的数值
+- 对于后续时间窗口，节点仍会复用上一窗口已经生成好的历史 latent，再把这段历史作为冻结上下文，仅继续更新新增帧
 
 对于非首个时间窗口，代码会在视频分支前面额外补入一帧首时间切片，再在输出时移除，用于做当前实现中的 LTX 首帧因果补偿。
 
@@ -93,10 +100,12 @@
 原生节点是一次性对整段 latent 做采样；本插件的执行逻辑是：
 
 1. 先为完整 latent 生成一次噪声
-2. 根据 `sample_frames` 和 `overlap_frames` 构造时间窗口
-3. 每个时间窗口内按需决定是否继续做空间切块
-4. 空间 tile 输出经权重融合后回写当前窗口
-5. 仅保留每个窗口的新增区域，再按时间顺序拼接成完整输出
+2. 先校验 `sample_frames` 和 `overlap_frames` 为 `8` 的倍数
+3. 后台先对这两个输入值执行 `+1`
+4. 再将它们从视频帧换算为 latent 时间窗口参数
+5. 每个时间窗口内按需决定是否继续做空间切块
+6. 空间 tile 输出经权重融合后回写当前窗口
+7. 仅保留每个窗口的新增区域，再按时间顺序拼接成完整输出
 
 如果当前 latent 不需要时间窗口，且 tile 也未小于 latent 尺寸，则直接走一次完整采样的 fast path。
 

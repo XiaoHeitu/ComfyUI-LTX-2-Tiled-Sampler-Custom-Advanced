@@ -4,7 +4,7 @@
     LTX 2.3 1920x1024 / 30fps / 8s 实测对比
   </text>
   <text x="60" y="116" fill="#94A3B8" font-family="Arial, Helvetica, sans-serif" font-size="20">
-    RTX 3070 8GB VRAM / 32GB RAM / sample_frames=32 / overlap_frames=2 / tile_size=480 / tile_overlap=192
+    RTX 3070 8GB VRAM / 32GB RAM / sample_frames=248 / overlap_frames=8 / tile_size=480 / tile_overlap=192
   </text>
 
   <line x1="220" y1="170" x2="1080" y2="170" stroke="#1E293B" stroke-width="1"/>

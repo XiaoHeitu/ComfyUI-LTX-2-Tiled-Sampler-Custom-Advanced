@@ -93,24 +93,26 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                 io.Latent.Input("latent_image"),
                 io.Int.Input(
                     "sample_frames",
-                    default=32,
-                    min=1,
+                    default=248,
+                    min=8,
                     max=4096,
-                    tooltip="每个后续时间窗口新增的 latent 帧数。",
+                    step=8,
+                    tooltip="每个后续时间窗口新增的视频帧数；输入必须为 8 的倍数，内部会先 +1，再按 LTX 时间缩放比例转换为 latent 帧。",
                 ),
                 io.Int.Input(
                     "overlap_frames",
-                    default=4,
+                    default=24,
                     min=0,
                     max=4096,
-                    tooltip="时间窗口之间回看的 latent 重叠帧数。",
+                    step=8,
+                    tooltip="时间窗口之间回看的视频重叠帧数；输入必须为 8 的倍数，内部会先 +1，再按 LTX 时间缩放比例转换为 latent 帧。",
                 ),
                 io.Int.Input(
                     "tile_size",
                     default=512,
                     min=32,
                     max=comfy_nodes.MAX_RESOLUTION,
-                    step=8,
+                    step=32,
                     tooltip="空间分片尺寸，使用像素单位；内部会按 LTX latent 缩放比例转换为 latent 空间 tile。",
                 ),
                 io.Int.Input(
@@ -118,7 +120,7 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                     default=192,
                     min=0,
                     max=comfy_nodes.MAX_RESOLUTION,
-                    step=8,
+                    step=32,
                     tooltip="空间分片重合宽度，使用像素单位；内部会按 LTX latent 缩放比例转换为 latent 空间 overlap。",
                 ),
             ],
@@ -139,6 +141,46 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                 pass
         latent_format = guider.model_patcher.get_model_object("latent_format")
         return max(1, int(getattr(latent_format, "spacial_downscale_ratio", 32)))
+
+    @classmethod
+    def _get_temporal_ratio(cls, latent: dict, guider) -> int:
+        ratio = latent.get("downscale_ratio_temporal", None)
+        if ratio is not None:
+            try:
+                return max(1, int(round(float(ratio))))
+            except (TypeError, ValueError):
+                pass
+        latent_format = guider.model_patcher.get_model_object("latent_format")
+        for attr_name in ("temporal_downscale_ratio", "downscale_ratio_temporal", "time_scale_factor"):
+            value = getattr(latent_format, attr_name, None)
+            if value is None:
+                continue
+            try:
+                return max(1, int(round(float(value))))
+            except (TypeError, ValueError):
+                continue
+        return 8
+
+    @staticmethod
+    def _video_frames_to_latent_frames(video_frames: int, temporal_ratio: int) -> int:
+        video_frames = int(video_frames)
+        if video_frames <= 0:
+            return 0
+        return max(1, ((video_frames - 1) // max(1, int(temporal_ratio))) + 1)
+
+    @staticmethod
+    def _input_video_frames_to_effective_video_frames(video_frames: int) -> int:
+        video_frames = int(video_frames)
+        if video_frames < 0:
+            return 0
+        return video_frames + 1
+
+    @staticmethod
+    def _latent_frames_to_video_frames(latent_frames: int, temporal_ratio: int) -> int:
+        latent_frames = int(latent_frames)
+        if latent_frames <= 0:
+            return 0
+        return ((latent_frames - 1) * max(1, int(temporal_ratio))) + 1
 
     @classmethod
     def _convert_pixel_tiles_to_latent(cls, tile_size: int, tile_overlap: int, spatial_ratio: int) -> tuple[int, int]:
@@ -623,10 +665,14 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
 
     @classmethod
     def execute(cls, noise, guider, sampler, sigmas, latent_image, sample_frames, overlap_frames, tile_size, tile_overlap, unique_id=None) -> io.NodeOutput:
-        if sample_frames < 1:
-            raise ValueError("采样帧数必须 >= 1。")
+        if sample_frames < 8:
+            raise ValueError("采样帧数（视频帧输入）必须 >= 8，且为 8 的倍数。")
+        if sample_frames % 8 != 0:
+            raise ValueError("采样帧数（视频帧输入）必须为 8 的倍数；后台会在换算前自动 +1。")
         if overlap_frames < 0:
-            raise ValueError("时间重叠帧数必须 >= 0。")
+            raise ValueError("时间重叠帧数（视频帧输入）必须 >= 0。")
+        if overlap_frames % 8 != 0:
+            raise ValueError("时间重叠帧数（视频帧输入）必须为 8 的倍数；后台会在换算前自动 +1。")
 
         latent = latent_image.copy()
         fixed_samples = comfy.sample.fix_empty_latent_channels(
@@ -639,6 +685,7 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
         latent_kind = detect_latent_kind(fixed_samples)
         noise_mask = latent.get("noise_mask", None)
 
+        temporal_ratio = cls._get_temporal_ratio(latent, guider)
         spatial_ratio = cls._get_spatial_ratio(latent, guider)
         latent_tile, latent_overlap = cls._convert_pixel_tiles_to_latent(tile_size, tile_overlap, spatial_ratio)
 
@@ -652,15 +699,29 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
             latent_h = video_samples.shape[3]
             latent_w = video_samples.shape[4]
 
+        total_video_frames = cls._latent_frames_to_video_frames(total_frames, temporal_ratio)
+        sample_effective_video_frames = cls._input_video_frames_to_effective_video_frames(sample_frames)
+        overlap_effective_video_frames = cls._input_video_frames_to_effective_video_frames(overlap_frames)
+        sample_latent_frames = cls._video_frames_to_latent_frames(sample_effective_video_frames, temporal_ratio)
+        overlap_latent_frames = cls._video_frames_to_latent_frames(overlap_effective_video_frames, temporal_ratio)
         use_spatial_tiles = latent_tile < max(latent_h, latent_w)
-        use_time_windows = sample_frames < total_frames
+        use_time_windows = sample_latent_frames < total_frames
 
         full_noise = noise.generate_noise(latent)
         sampler_steps = max(0, int(sigmas.shape[-1] - 1))
-        window_count = len(build_time_windows(total_frames, sample_frames, overlap_frames))
+        window_count = len(build_time_windows(total_frames, sample_latent_frames, overlap_latent_frames))
         tile_count = len(build_spatial_tiles(latent_h, latent_w, latent_tile, latent_overlap))
         total_progress_steps = max(1, window_count * tile_count * sampler_steps)
         progress_state = _GlobalSamplerProgress(guider.model_patcher, total_progress_steps, node_id=unique_id)
+        print(
+            f"[LTX2TiledSampler] 时间窗口配置: sample_frames(input_video)={sample_frames} "
+            f"overlap_frames(input_video)={overlap_frames} "
+            f"sample_frames(effective_video)={sample_effective_video_frames} "
+            f"overlap_frames(effective_video)={overlap_effective_video_frames} temporal_ratio={temporal_ratio} "
+            f"sample_frames(latent)={sample_latent_frames} overlap_frames(latent)={overlap_latent_frames} "
+            f"total_frames(latent)={total_frames} total_frames(video)={total_video_frames}",
+            flush=True,
+        )
         print(
             f"[LTX2TiledSampler] 全局进度模式: windows={window_count} tiles_per_window={tile_count} "
             f"sampler_steps={sampler_steps} total_progress_steps={total_progress_steps}",
@@ -689,8 +750,8 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                         fixed_samples,
                         full_noise,
                         noise_mask,
-                        sample_frames,
-                        overlap_frames,
+                        sample_latent_frames,
+                        overlap_latent_frames,
                         latent_tile,
                         latent_overlap,
                         noise.seed,
@@ -704,8 +765,8 @@ class LTX2TiledSamplerCustomAdvanced(io.ComfyNode):
                         fixed_samples,
                         full_noise,
                         noise_mask,
-                        sample_frames,
-                        overlap_frames,
+                        sample_latent_frames,
+                        overlap_latent_frames,
                         latent_tile,
                         latent_overlap,
                         noise.seed,
